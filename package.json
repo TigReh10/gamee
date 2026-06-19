@@ -1,0 +1,14 @@
+{
+  "name": "tlou2-fan-tribute",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Unofficial 3D first-person stealth fan tribute (The Last of Us Part II), built with Three.js.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --host"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}
