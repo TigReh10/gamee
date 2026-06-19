@@ -1,18 +1,13 @@
 /* =========================================================================
-   THE LAST OF US — PART II  (unofficial fan tribute)
-   An original top-down stealth-survival game.
-   All code and art are original and drawn at runtime on a <canvas>.
-   No copyrighted assets are used.
+   THE LAST OF US — PART II  (unofficial 3D fan tribute)
+   First-person stealth-survival built with Three.js.
+   100% original code & geometry. No copyrighted assets are used.
+   Requires THREE (loaded from CDN in index.html).
    ========================================================================= */
-
 (() => {
   'use strict';
+  const THREE = window.THREE;
 
-  // ---------------------------------------------------------------------
-  // Canvas / DOM
-  // ---------------------------------------------------------------------
-  const canvas = document.getElementById('game');
-  const ctx = canvas.getContext('2d');
   const ui = {
     hp: document.getElementById('hpFill'),
     ammo: document.getElementById('ammo'),
@@ -25,892 +20,721 @@
     overlayText: document.getElementById('overlayText'),
     overlayBtn: document.getElementById('overlayBtn'),
     toast: document.getElementById('toast'),
+    crosshair: document.getElementById('crosshair'),
+    flash: document.getElementById('flash'),
   };
 
-  let W = 0, H = 0;
-  function resize() {
-    W = canvas.width = window.innerWidth;
-    H = canvas.height = window.innerHeight;
+  if (!THREE) {
+    ui.overlayTitle.textContent = 'Failed to load 3D engine';
+    ui.overlayText.textContent = 'Three.js could not be loaded. Check your internet connection and refresh.';
+    ui.overlay.classList.add('show');
+    ui.overlayBtn.style.display = 'none';
+    return;
   }
-  window.addEventListener('resize', resize);
-  resize();
 
-  // ---------------------------------------------------------------------
-  // Constants
-  // ---------------------------------------------------------------------
-  const TILE = 44;
-  const FOV = Math.PI * 0.62;       // runner vision cone
-  const TWO_PI = Math.PI * 2;
+  // ---------- helpers ----------
   const rand = (a, b) => a + Math.random() * (b - a);
   const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
-  const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
-  const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+  const TWO_PI = Math.PI * 2;
   function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= TWO_PI; while (d < -Math.PI) d += TWO_PI; return d; }
 
-  // ---------------------------------------------------------------------
-  // Level definition
-  // Tiles: 0 floor, 1 wall, 2 cover crate, 3 tall grass, 4 exit pad
-  // ---------------------------------------------------------------------
-  const MAP_W = 56, MAP_H = 40;
-  let grid = [];
+  // ---------- constants ----------
+  const CS = 4;                 // world units per grid cell
+  const GW = 30, GH = 30;       // grid size
+  const WALL_H = 3.4;
+  const EYE = 1.6;
+  const PLAYER_R = 0.42;
 
-  function buildLevel() {
+  // ---------- renderer / scene ----------
+  const canvas = document.getElementById('game');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+  const scene = new THREE.Scene();
+  const SKY = 0x10151c;
+  scene.background = new THREE.Color(SKY);
+  scene.fog = new THREE.Fog(SKY, 8, 52);
+
+  const camera = new THREE.PerspectiveCamera(74, window.innerWidth / window.innerHeight, 0.05, 300);
+  camera.rotation.order = 'YXZ';
+
+  // ambient + hemisphere so geometry is always readable (not pitch black)
+  scene.add(new THREE.AmbientLight(0x3a4452, 0.7));
+  const hemi = new THREE.HemisphereLight(0x68788c, 0x20262e, 0.65);
+  scene.add(hemi);
+  // faint moonlight
+  const moon = new THREE.DirectionalLight(0x8fa6c4, 0.35);
+  moon.position.set(-30, 60, 20);
+  scene.add(moon);
+
+  // flashlight = spotlight attached to camera
+  const flashlight = new THREE.SpotLight(0xfff0d0, 0, 60, Math.PI / 7, 0.45, 1.2);
+  flashlight.castShadow = true;
+  flashlight.shadow.mapSize.set(1024, 1024);
+  scene.add(flashlight);
+  const flashTarget = new THREE.Object3D();
+  scene.add(flashTarget);
+  flashlight.target = flashTarget;
+  let flashOn = true;
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ---------- textures (generated, no external files) ----------
+  function makeNoiseTexture(base, spread, lines) {
+    const c = document.createElement('canvas'); c.width = c.height = 128;
+    const g = c.getContext('2d');
+    g.fillStyle = base; g.fillRect(0, 0, 128, 128);
+    for (let i = 0; i < 900; i++) {
+      const v = (Math.random() * spread) | 0;
+      g.fillStyle = `rgba(${v},${v},${v},0.10)`;
+      g.fillRect(Math.random() * 128, Math.random() * 128, 2, 2);
+    }
+    if (lines) {
+      g.strokeStyle = 'rgba(0,0,0,0.28)'; g.lineWidth = 2;
+      g.strokeRect(1, 1, 126, 126);
+    }
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    return t;
+  }
+  const floorTex = makeNoiseTexture('#24282d', 120, false);
+  floorTex.repeat.set(GW, GH);
+  const wallTex = makeNoiseTexture('#3a3026', 90, true);
+  const ceilTex = makeNoiseTexture('#15181d', 60, false);
+  ceilTex.repeat.set(GW, GH);
+
+  // ---------- level generation ----------
+  let grid = [];
+  let walls = [];           // {x,z} cell centers for collision
+  let exitCell = null;
+  const wallSet = new Set();
+  const key = (i, j) => i + ',' + j;
+
+  function genGrid() {
     grid = [];
-    for (let y = 0; y < MAP_H; y++) {
+    for (let j = 0; j < GH; j++) {
       const row = [];
-      for (let x = 0; x < MAP_W; x++) {
-        const border = (x === 0 || y === 0 || x === MAP_W - 1 || y === MAP_H - 1);
-        row.push(border ? 1 : 0);
-      }
+      for (let i = 0; i < GW; i++) row.push(i === 0 || j === 0 || i === GW - 1 || j === GH - 1 ? 1 : 0);
       grid.push(row);
     }
-
-    const wallRect = (x, y, w, h) => {
+    // interior structures (rooms / debris) leaving open lanes
+    const blocks = 16;
+    for (let b = 0; b < blocks; b++) {
+      const w = Math.floor(rand(1, 4)), h = Math.floor(rand(1, 4));
+      const x = Math.floor(rand(3, GW - 3 - w)), y = Math.floor(rand(3, GH - 3 - h));
       for (let j = y; j < y + h; j++)
         for (let i = x; i < x + w; i++)
-          if (grid[j] && grid[j][i] !== undefined) grid[j][i] = 1;
-    };
-    const fillRect = (x, y, w, h, t) => {
-      for (let j = y; j < y + h; j++)
-        for (let i = x; i < x + w; i++)
-          if (grid[j] && grid[j][i] !== undefined) grid[j][i] = t;
-    };
-
-    // Building blocks — a ruined Seattle block layout
-    wallRect(8, 0, 1, 11);
-    wallRect(8, 14, 1, 12);
-    wallRect(0, 11, 6, 1);
-    wallRect(16, 6, 1, 14);
-    wallRect(16, 6, 10, 1);
-    wallRect(25, 6, 1, 9);
-    wallRect(20, 19, 12, 1);
-    wallRect(31, 10, 1, 10);
-    wallRect(36, 0, 1, 14);
-    wallRect(36, 17, 1, 13);
-    wallRect(36, 24, 12, 1);
-    wallRect(44, 8, 1, 16);
-    wallRect(40, 8, 5, 1);
-    wallRect(10, 28, 18, 1);
-    wallRect(10, 28, 1, 8);
-    wallRect(22, 28, 1, 8);
-    wallRect(31, 24, 1, 13);
-    wallRect(46, 28, 9, 1);
-    wallRect(46, 28, 1, 8);
-
-    // Cover crates / debris (crouch behind these)
-    const crates = [
-      [4, 5], [5, 5], [4, 6], [12, 3], [13, 3], [12, 9], [13, 16], [14, 16],
-      [20, 9], [21, 9], [22, 12], [28, 9], [29, 9], [28, 16], [33, 14], [34, 14],
-      [40, 4], [41, 4], [40, 18], [41, 18], [48, 12], [49, 12], [48, 13],
-      [14, 31], [15, 31], [26, 31], [27, 31], [34, 30], [35, 30], [50, 31], [51, 31],
-      [6, 22], [7, 22], [19, 24], [20, 24], [42, 30], [43, 30],
-    ];
-    crates.forEach(([x, y]) => { if (grid[y] && grid[y][x] === 0) grid[y][x] = 2; });
-
-    // Tall grass patches (hide while crouched)
-    const grassPatches = [[2, 2, 4, 3], [10, 20, 5, 4], [18, 14, 4, 3], [26, 22, 4, 3],
-      [38, 14, 3, 3], [46, 18, 4, 3], [4, 32, 4, 4], [24, 12, 3, 3], [12, 24, 3, 3]];
-    grassPatches.forEach(([x, y, w, h]) => {
-      for (let j = y; j < y + h; j++)
-        for (let i = x; i < x + w; i++)
-          if (grid[j] && grid[j][i] === 0) grid[j][i] = 3;
-    });
-
-    // Extraction pad (exit)
-    fillRect(50, 2, 4, 4, 4);
+          grid[j][i] = 1;
+    }
+    // scattered pillars
+    for (let p = 0; p < 22; p++) {
+      const i = Math.floor(rand(2, GW - 2)), j = Math.floor(rand(2, GH - 2));
+      grid[j][i] = 1;
+    }
+    // carve guaranteed-open zones: spawn (2,2) and exit (GW-3,GH-3)
+    carve(2, 2, 3); carve(GW - 4, GH - 4, 3);
+    exitCell = { i: GW - 3, j: GH - 3 };
+    grid[exitCell.j][exitCell.i] = 0;
   }
+  function carve(ci, cj, r) {
+    for (let j = cj - r; j <= cj + r; j++)
+      for (let i = ci - r; i <= ci + r; i++)
+        if (j > 0 && i > 0 && j < GH - 1 && i < GW - 1) grid[j][i] = 0;
+  }
+  const isWallCell = (i, j) => (i < 0 || j < 0 || i >= GW || j >= GH) ? true : grid[j][i] === 1;
+  const cellToWorld = (i, j) => ({ x: (i + 0.5) * CS, z: (j + 0.5) * CS });
+  const worldToCell = (x, z) => ({ i: Math.floor(x / CS), j: Math.floor(z / CS) });
 
-  const tileAt = (px, py) => {
-    const tx = Math.floor(px / TILE), ty = Math.floor(py / TILE);
-    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return 1;
-    return grid[ty][tx];
-  };
-  const isWall = (px, py) => tileAt(px, py) === 1;
-  const isGrass = (px, py) => tileAt(px, py) === 3;
-  const isExit = (px, py) => tileAt(px, py) === 4;
-
-  // Line of sight — true if a wall blocks the segment
-  function losBlocked(x1, y1, x2, y2) {
-    const d = Math.hypot(x2 - x1, y2 - y1);
-    const steps = Math.ceil(d / (TILE * 0.5));
-    for (let i = 1; i < steps; i++) {
-      const t = i / steps;
-      if (isWall(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)) return true;
+  // collision: circle vs wall cells
+  function blocked(x, z, r) {
+    for (const [dx, dz] of [[-r, -r], [r, -r], [-r, r], [r, r], [0, 0]]) {
+      const c = worldToCell(x + dx, z + dz);
+      if (isWallCell(c.i, c.j)) return true;
     }
     return false;
   }
 
-  // ---------------------------------------------------------------------
-  // Audio (synthesized — no external files)
-  // ---------------------------------------------------------------------
+  // line of sight on the grid (DDA-ish sampling)
+  function losClear(x1, z1, x2, z2) {
+    const d = Math.hypot(x2 - x1, z2 - z1);
+    const steps = Math.ceil(d / (CS * 0.4));
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps;
+      const c = worldToCell(x1 + (x2 - x1) * t, z1 + (z2 - z1) * t);
+      if (isWallCell(c.i, c.j)) return false;
+    }
+    return true;
+  }
+
+  // ---------- build meshes ----------
+  let levelGroup = null;
+  const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.95, metalness: 0.0, color: 0x9a8a72 });
+  const wallGeo = new THREE.BoxGeometry(CS, WALL_H, CS);
+
+  function buildLevel() {
+    if (levelGroup) scene.remove(levelGroup);
+    levelGroup = new THREE.Group();
+    walls = []; wallSet.clear();
+
+    // floor
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(GW * CS, GH * CS),
+      new THREE.MeshStandardMaterial({ map: floorTex, roughness: 1, metalness: 0, color: 0x6a7078 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(GW * CS / 2, 0, GH * CS / 2);
+    floor.receiveShadow = true;
+    levelGroup.add(floor);
+
+    // ceiling
+    const ceil = new THREE.Mesh(
+      new THREE.PlaneGeometry(GW * CS, GH * CS),
+      new THREE.MeshStandardMaterial({ map: ceilTex, roughness: 1, color: 0x4a525c })
+    );
+    ceil.rotation.x = Math.PI / 2;
+    ceil.position.set(GW * CS / 2, WALL_H, GH * CS / 2);
+    levelGroup.add(ceil);
+
+    // walls (merge into instanced-ish group of meshes)
+    for (let j = 0; j < GH; j++) {
+      for (let i = 0; i < GW; i++) {
+        if (grid[j][i] === 1) {
+          const w = cellToWorld(i, j);
+          const m = new THREE.Mesh(wallGeo, wallMat);
+          m.position.set(w.x, WALL_H / 2, w.z);
+          m.castShadow = true; m.receiveShadow = true;
+          levelGroup.add(m);
+          walls.push(w); wallSet.add(key(i, j));
+        }
+      }
+    }
+
+    // exit pad marker (green glow)
+    const ew = cellToWorld(exitCell.i, exitCell.j);
+    const pad = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.5, 1.5, 0.12, 24),
+      new THREE.MeshStandardMaterial({ color: 0x37d27a, emissive: 0x1f7a44, emissiveIntensity: 0.9 })
+    );
+    pad.position.set(ew.x, 0.06, ew.z);
+    levelGroup.add(pad);
+    const padLight = new THREE.PointLight(0x49e08a, 0.0, 14, 2);
+    padLight.position.set(ew.x, 1.5, ew.z);
+    padLight.userData.isExitLight = true;
+    levelGroup.add(padLight);
+    exitPad = pad; exitLight = padLight;
+
+    scene.add(levelGroup);
+  }
+  let exitPad = null, exitLight = null;
+
+  // ---------- entities ----------
+  let enemies = [], pickups = [], tracers = [], bottlesInAir = [], noises = [];
+  let enemyMeshes = [];   // for raycasting
+
+  function makeEnemyMesh(type) {
+    const g = new THREE.Group();
+    const bodyColor = type === 'clicker' ? 0x9a9384 : 0x6e4038;
+    const body = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.42, 0.5, 1.5, 10),
+      new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.9 })
+    );
+    body.position.y = 0.95; body.castShadow = true;
+    body.userData.isEnemyHit = true;
+    g.add(body);
+    const headColor = type === 'clicker' ? 0xd8cdb4 : 0x8a5246;
+    const head = new THREE.Mesh(
+      new THREE.SphereGeometry(0.34, 12, 10),
+      new THREE.MeshStandardMaterial({ color: headColor, roughness: 0.85 })
+    );
+    head.position.y = 1.95; head.castShadow = true;
+    head.userData.isEnemyHit = true;
+    g.add(head);
+    if (type === 'clicker') {
+      // fungal bloom
+      for (let k = 0; k < 6; k++) {
+        const b = new THREE.Mesh(
+          new THREE.SphereGeometry(rand(0.12, 0.2), 7, 6),
+          new THREE.MeshStandardMaterial({ color: 0xe7dcc2, emissive: 0x3a3320, emissiveIntensity: 0.3 })
+        );
+        const a = (k / 6) * TWO_PI;
+        b.position.set(Math.cos(a) * 0.28, 1.95 + Math.sin(a) * 0.2, Math.sin(a) * 0.28);
+        g.add(b);
+      }
+    } else {
+      // eyes
+      const eyeMat = new THREE.MeshStandardMaterial({ color: 0xff3322, emissive: 0xaa1100, emissiveIntensity: 0.8 });
+      for (const sx of [-0.13, 0.13]) {
+        const eye = new THREE.Mesh(new THREE.SphereGeometry(0.06, 6, 6), eyeMat);
+        eye.position.set(sx, 2.0, 0.3);
+        g.add(eye);
+      }
+    }
+    return g;
+  }
+
+  function spawnEnemy(type, i, j) {
+    const w = cellToWorld(i, j);
+    const mesh = makeEnemyMesh(type);
+    mesh.position.set(w.x, 0, w.z);
+    scene.add(mesh);
+    const e = {
+      type, mesh, x: w.x, z: w.z, ang: rand(0, TWO_PI),
+      hp: type === 'clicker' ? 70 : 45,
+      maxHp: type === 'clicker' ? 70 : 45,
+      speed: type === 'clicker' ? 1.7 : 2.5,
+      chaseSpeed: type === 'clicker' ? 3.0 : 4.4,
+      state: 'patrol', alert: 0, lastX: w.x, lastZ: w.z,
+      wps: [], wpi: 0, investigateT: 0, atkCd: 0, dead: false, bob: rand(0, TWO_PI),
+    };
+    for (let k = 0; k < 4; k++) {
+      let wx, wz, tries = 0;
+      do { const di = Math.floor(rand(-4, 4)), dj = Math.floor(rand(-4, 4));
+        const c = worldToCell(w.x, w.z);
+        wx = (c.i + di + 0.5) * CS; wz = (c.j + dj + 0.5) * CS; tries++;
+      } while (blocked(wx, wz, PLAYER_R) && tries < 14);
+      e.wps.push({ x: wx, z: wz });
+    }
+    mesh.traverse(o => { if (o.userData.isEnemyHit) { o.userData.enemy = e; enemyMeshes.push(o); } });
+    enemies.push(e);
+  }
+
+  function makePickupMesh(type) {
+    const colors = { ammo: 0xe0c060, bottle: 0x7fb8a0, kit: 0x46c46e, supplies: 0x5aa0ff };
+    const c = colors[type];
+    let mesh;
+    if (type === 'ammo') mesh = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.25, 0.6), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: 0.25 }));
+    else if (type === 'bottle') mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.5, 8), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: 0.25, transparent: true, opacity: 0.85 }));
+    else if (type === 'kit') mesh = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: 0.25 }));
+    else mesh = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.5), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: 0.5 }));
+    return mesh;
+  }
+  function spawnPickup(type, i, j) {
+    const w = cellToWorld(i, j);
+    const mesh = makePickupMesh(type);
+    mesh.position.set(w.x, 0.6, w.z);
+    scene.add(mesh);
+    const light = new THREE.PointLight({ ammo: 0xe0c060, bottle: 0x7fb8a0, kit: 0x46c46e, supplies: 0x5aa0ff }[type], 0.5, 4, 2);
+    light.position.set(w.x, 0.8, w.z);
+    scene.add(light);
+    pickups.push({ type, mesh, light, x: w.x, z: w.z, taken: false, bob: rand(0, TWO_PI) });
+  }
+
+  function randomFloorCell(minDistFromSpawn) {
+    for (let t = 0; t < 200; t++) {
+      const i = Math.floor(rand(2, GW - 2)), j = Math.floor(rand(2, GH - 2));
+      if (grid[j][i] !== 0) continue;
+      const w = cellToWorld(i, j);
+      if (Math.hypot(w.x - CS * 2.5, w.z - CS * 2.5) < minDistFromSpawn) continue;
+      return { i, j };
+    }
+    return { i: Math.floor(GW / 2), j: Math.floor(GH / 2) };
+  }
+
+  // ---------- player ----------
+  let player;
+  function resetPlayer() {
+    const w = cellToWorld(2, 2);
+    player = { x: w.x, z: w.z, yaw: Math.PI / 4, pitch: 0, hp: 100, maxHp: 100,
+      ammo: 8, bottles: 2, kits: 1, crouch: false, meleeCd: 0, hurtCd: 0, footT: 0, dead: false };
+  }
+
+  // ---------- world reset ----------
+  let suppliesTaken = false, exitOpen = false, gameTime = 0, maxAlert = 0;
+  function clearScene() {
+    for (const e of enemies) scene.remove(e.mesh);
+    for (const p of pickups) { scene.remove(p.mesh); scene.remove(p.light); }
+    enemies = []; pickups = []; tracers.forEach(t => scene.remove(t.line)); tracers = [];
+    bottlesInAir.forEach(b => scene.remove(b.mesh)); bottlesInAir = [];
+    enemyMeshes = []; noises = [];
+  }
+  function resetWorld() {
+    clearScene();
+    genGrid();
+    buildLevel();
+    resetPlayer();
+    // enemies
+    const types = ['runner', 'clicker', 'runner', 'runner', 'clicker', 'runner', 'clicker', 'runner', 'runner', 'clicker'];
+    for (const t of types) { const c = randomFloorCell(CS * 6); spawnEnemy(t, c.i, c.j); }
+    // pickups
+    const items = ['ammo', 'ammo', 'ammo', 'kit', 'kit', 'bottle', 'bottle', 'bottle'];
+    for (const it of items) { const c = randomFloorCell(CS * 3); spawnPickup(it, c.i, c.j); }
+    // supplies near exit corner
+    spawnPickup('supplies', GW - 5, GH - 5);
+    suppliesTaken = false; exitOpen = false; gameTime = 0; maxAlert = 0; flashOn = true;
+    setObjective('Find the surgical supplies, then reach the green extraction pad.');
+  }
+
+  // ---------- audio ----------
   let AC = null;
-  function actx() {
-    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
-    return AC;
-  }
-  function blip(freq, dur, type, vol) {
-    const ac = actx(); if (!ac) return;
-    const o = ac.createOscillator(), g = ac.createGain();
-    o.type = type || 'sine'; o.frequency.value = freq;
-    g.gain.value = vol || 0.05;
-    o.connect(g); g.connect(ac.destination);
-    const now = ac.currentTime;
-    g.gain.setValueAtTime(g.gain.value, now);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    o.start(now); o.stop(now + dur);
-  }
-  function noiseBurst(dur, vol) {
-    const ac = actx(); if (!ac) return;
-    const n = Math.floor(ac.sampleRate * dur);
-    const buf = ac.createBuffer(1, n, ac.sampleRate);
-    const data = buf.getChannelData(0);
-    for (let i = 0; i < n; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / n);
-    const src = ac.createBufferSource(); src.buffer = buf;
-    const g = ac.createGain(); g.gain.value = vol || 0.2;
-    src.connect(g); g.connect(ac.destination); src.start();
-  }
+  const actx = () => { if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } return AC; };
+  function blip(f, d, type, v) { const ac = actx(); if (!ac) return; const o = ac.createOscillator(), g = ac.createGain(); o.type = type || 'sine'; o.frequency.value = f; g.gain.value = v || 0.05; o.connect(g); g.connect(ac.destination); const n = ac.currentTime; g.gain.exponentialRampToValueAtTime(0.0001, n + d); o.start(n); o.stop(n + d); }
+  function noise(d, v) { const ac = actx(); if (!ac) return; const n = Math.floor(ac.sampleRate * d); const buf = ac.createBuffer(1, n, ac.sampleRate); const dt = buf.getChannelData(0); for (let i = 0; i < n; i++) dt[i] = (Math.random() * 2 - 1) * (1 - i / n); const s = ac.createBufferSource(); s.buffer = buf; const g = ac.createGain(); g.gain.value = v || 0.2; s.connect(g); g.connect(ac.destination); s.start(); }
   const sfx = {
-    shot: () => { noiseBurst(0.18, 0.35); blip(120, 0.18, 'square', 0.12); },
-    melee: () => { noiseBurst(0.08, 0.18); },
+    shot: () => { noise(0.18, 0.35); blip(110, 0.18, 'square', 0.12); },
+    melee: () => noise(0.08, 0.18),
+    hurt: () => blip(150, 0.18, 'sawtooth', 0.12),
+    kill: () => { noise(0.12, 0.15); blip(80, 0.2, 'square', 0.08); },
     pickup: () => { blip(660, 0.08, 'triangle', 0.08); blip(880, 0.08, 'triangle', 0.06); },
-    hurt: () => { blip(160, 0.18, 'sawtooth', 0.12); },
-    kill: () => { noiseBurst(0.12, 0.15); blip(90, 0.2, 'square', 0.08); },
-    bottle: () => { blip(420, 0.12, 'triangle', 0.07); noiseBurst(0.06, 0.1); },
-    click: () => { blip(1200, 0.03, 'square', 0.05); },
+    bottle: () => { blip(420, 0.12, 'triangle', 0.07); noise(0.06, 0.1); },
+    click: () => blip(1200, 0.03, 'square', 0.05),
     win: () => { blip(523, 0.2, 'triangle', 0.1); setTimeout(() => blip(784, 0.3, 'triangle', 0.1), 180); },
   };
 
-  // ---------------------------------------------------------------------
-  // Input
-  // ---------------------------------------------------------------------
+  // ---------- input ----------
   const keys = {};
-  const mouse = { x: 0, y: 0, down: false, right: false };
-  window.addEventListener('keydown', e => {
-    keys[e.code] = true;
-    if (['Space', 'ShiftLeft', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
-    if (e.code === 'KeyE') tryTakedown();
-    if (e.code === 'KeyF') flashlight = !flashlight;
-    if (e.code === 'KeyR') useKit();
-    if (e.code === 'Escape' || e.code === 'KeyP') { if (state === 'playing') pause(); else if (state === 'paused') resume(); }
-  });
-  window.addEventListener('keyup', e => { keys[e.code] = false; });
-  canvas.addEventListener('mousemove', e => {
-    const r = canvas.getBoundingClientRect();
-    mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
-  });
-  canvas.addEventListener('mousedown', e => {
-    if (state !== 'playing') return;
-    if (e.button === 0) { mouse.down = true; shoot(); }
-    if (e.button === 2) { mouse.right = true; throwBottle(); }
-  });
-  canvas.addEventListener('mouseup', e => {
-    if (e.button === 0) mouse.down = false;
-    if (e.button === 2) mouse.right = false;
-  });
-  canvas.addEventListener('contextmenu', e => e.preventDefault());
-
-  // ---------------------------------------------------------------------
-  // Entities
-  // ---------------------------------------------------------------------
-  let player, enemies, pickups, projectiles, particles, noises, supplies, exitOpen;
-  let camX = 0, camY = 0, flashlight = true, gameTime = 0, alertTimer = 0;
   let state = 'menu';
-  let toastTimer = 0;
+  document.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+    if (state !== 'playing') return;
+    if (e.code === 'KeyE') tryTakedown();
+    if (e.code === 'KeyF') flashOn = !flashOn;
+    if (e.code === 'KeyR') useKit();
+    if (e.code === 'Space') melee();
+  });
+  document.addEventListener('keyup', e => { keys[e.code] = false; });
 
-  function spawnPlayer(tx, ty) {
-    player = {
-      x: tx * TILE + TILE / 2, y: ty * TILE + TILE / 2, r: 12,
-      hp: 100, maxHp: 100, ang: 0, speed: 150, crouch: false,
-      ammo: 7, bottles: 2, kits: 1, meleeCd: 0, hurtCd: 0, footTimer: 0,
-      dead: false,
-    };
-  }
+  canvas.addEventListener('click', () => {
+    if (state === 'menu' || state === 'dead' || state === 'won') return;
+    if (document.pointerLockElement !== canvas) { canvas.requestPointerLock(); return; }
+  });
+  document.addEventListener('mousemove', e => {
+    if (document.pointerLockElement !== canvas || state !== 'playing') return;
+    const sens = 0.0022;
+    player.yaw -= e.movementX * sens;
+    player.pitch = clamp(player.pitch - e.movementY * sens, -1.2, 1.2);
+  });
+  document.addEventListener('mousedown', e => {
+    if (state !== 'playing' || document.pointerLockElement !== canvas) return;
+    if (e.button === 0) shoot();
+    if (e.button === 2) throwBottle();
+  });
+  document.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('pointerlockchange', () => {
+    if (document.pointerLockElement !== canvas && state === 'playing') pause();
+  });
 
-  function makeEnemy(type, tx, ty) {
-    const x = tx * TILE + TILE / 2, y = ty * TILE + TILE / 2;
-    const wps = [];
-    const n = 3;
-    for (let i = 0; i < n; i++) {
-      let wx, wy, tries = 0;
-      do {
-        wx = x + rand(-3, 3) * TILE; wy = y + rand(-3, 3) * TILE; tries++;
-      } while (isWall(wx, wy) && tries < 12);
-      wps.push({ x: clamp(wx, TILE, (MAP_W - 1) * TILE), y: clamp(wy, TILE, (MAP_H - 1) * TILE) });
-    }
-    return {
-      type, x, y, r: type === 'clicker' ? 13 : 12,
-      ang: rand(0, TWO_PI), spawnX: x, spawnY: y,
-      hp: type === 'clicker' ? 60 : 40,
-      speed: type === 'clicker' ? 52 : 74,
-      chaseSpeed: type === 'clicker' ? 92 : 132,
-      alert: 0, state: 'patrol', wps, wpi: 0,
-      lastX: x, lastY: y, investigateT: 0, attackCd: 0,
-      bob: rand(0, TWO_PI), dead: false,
-    };
-  }
+  // ---------- actions ----------
+  function forwardVec() { return { x: Math.sin(player.yaw), z: Math.cos(player.yaw) }; }
 
-  function reset() {
-    buildLevel();
-    spawnPlayer(3, 5);
-    enemies = [
-      makeEnemy('runner', 13, 4), makeEnemy('runner', 22, 11), makeEnemy('runner', 29, 14),
-      makeEnemy('clicker', 24, 10), makeEnemy('runner', 19, 23), makeEnemy('clicker', 14, 33),
-      makeEnemy('runner', 40, 6), makeEnemy('clicker', 42, 20), makeEnemy('runner', 48, 30),
-      makeEnemy('runner', 34, 30), makeEnemy('clicker', 39, 14), makeEnemy('runner', 47, 14),
-    ];
-    pickups = [
-      { type: 'ammo', tx: 5, ty: 3 }, { type: 'bottle', tx: 13, ty: 17 },
-      { type: 'kit', tx: 28, ty: 17 }, { type: 'ammo', tx: 33, ty: 13 },
-      { type: 'bottle', tx: 20, ty: 25 }, { type: 'ammo', tx: 41, ty: 19 },
-      { type: 'kit', tx: 50, ty: 14 }, { type: 'bottle', tx: 6, ty: 23 },
-      { type: 'supplies', tx: 47, ty: 31 }, { type: 'ammo', tx: 12, ty: 32 },
-      { type: 'bottle', tx: 35, ty: 30 }, { type: 'kit', tx: 19, ty: 9 },
-    ].map(p => ({ ...p, x: p.tx * TILE + TILE / 2, y: p.ty * TILE + TILE / 2, taken: false, bob: rand(0, TWO_PI) }));
-    projectiles = []; particles = []; noises = [];
-    supplies = 0; exitOpen = false;
-    flashlight = true; gameTime = 0; alertTimer = 0;
-    setObjective('Find the surgical supplies, then reach extraction (NE).');
-  }
-
-  // ---------------------------------------------------------------------
-  // Player actions
-  // ---------------------------------------------------------------------
-  function emitNoise(x, y, radius, strong) {
-    noises.push({ x, y, radius, life: 0.5, max: 0.5 });
+  function emitNoise(x, z, radius, strong) {
+    noises.push({ x, z, r: radius, life: 0.45, max: 0.45 });
     for (const e of enemies) {
       if (e.dead) continue;
-      const d = dist(e.x, e.y, x, y);
-      const hear = radius * (e.type === 'clicker' ? 1.35 : 1);
-      if (d < hear && !losBlocked(e.x, e.y, x, y)) {
-        e.lastX = x; e.lastY = y;
-        if (strong || e.type === 'clicker') { e.alert = Math.min(1, e.alert + 0.8); }
-        else e.alert = Math.min(1, e.alert + 0.45);
+      const d = Math.hypot(e.x - x, e.z - z);
+      const hear = radius * (e.type === 'clicker' ? 1.4 : 1);
+      if (d < hear && losClear(e.x, e.z, x, z)) {
+        e.lastX = x; e.lastZ = z;
+        e.alert = Math.min(1, e.alert + (strong ? 0.85 : 0.45));
         if (e.state === 'patrol') { e.state = 'investigate'; e.investigateT = 6; }
       }
     }
   }
 
+  const raycaster = new THREE.Raycaster();
   function shoot() {
     if (player.dead) return;
     if (player.ammo <= 0) { toast('Out of ammo'); blip(200, 0.05, 'square', 0.04); return; }
     player.ammo--;
-    const a = player.ang;
-    const sx = player.x + Math.cos(a) * 14, sy = player.y + Math.sin(a) * 14;
-    // hitscan
-    let bx = sx, by = sy, hitE = null, bestD = 1400;
-    for (let i = 0; i < 1400; i += 6) {
-      const px = sx + Math.cos(a) * i, py = sy + Math.sin(a) * i;
-      if (isWall(px, py)) { bx = px; by = py; break; }
-      for (const e of enemies) {
-        if (e.dead) continue;
-        if (dist2(px, py, e.x, e.y) < (e.r + 4) * (e.r + 4)) {
-          if (i < bestD) { bestD = i; hitE = e; bx = px; by = py; }
-        }
+    raycaster.setFromCamera({ x: 0, y: 0 }, camera);
+    const hits = raycaster.intersectObjects(enemyMeshes, false);
+    let end = raycaster.ray.at(60, new THREE.Vector3());
+    if (hits.length) {
+      const e = hits[0].object.userData.enemy;
+      end = hits[0].point;
+      if (e && !e.dead) {
+        e.hp -= 55;
+        if (e.hp <= 0) killEnemy(e); else { e.alert = 1; e.state = 'chase'; e.lastX = player.x; e.lastZ = player.z; }
       }
-      if (hitE) break;
-      bx = px; by = py;
     }
-    projectiles.push({ kind: 'tracer', x1: sx, y1: sy, x2: bx, y2: by, life: 0.06 });
-    if (hitE) {
-      hitE.hp -= 55; spark(bx, by, '#ff5544', 10);
-      if (hitE.hp <= 0) { killEnemy(hitE); }
-      else { hitE.alert = 1; hitE.state = 'chase'; hitE.lastX = player.x; hitE.lastY = player.y; }
-    }
+    spawnTracer(camera.position.clone(), end);
     sfx.shot();
-    emitNoise(player.x, player.y, 720, true);
-    shake(6);
+    flashMuzzle();
+    emitNoise(player.x, player.z, 34, true);
+  }
+
+  function spawnTracer(a, b) {
+    const geo = new THREE.BufferGeometry().setFromPoints([a, b]);
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffe69a }));
+    scene.add(line);
+    tracers.push({ line, life: 0.05 });
   }
 
   function throwBottle() {
     if (player.dead || player.bottles <= 0) { if (player.bottles <= 0) toast('No bottles'); return; }
     player.bottles--;
-    const a = player.ang;
-    const tx = mouse.x + camX, ty = mouse.y + camY;
-    projectiles.push({ kind: 'bottle', x: player.x, y: player.y, tx, ty,
-      vx: Math.cos(a), vy: Math.sin(a), life: 1.2 });
+    const f = forwardVec();
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 6), new THREE.MeshStandardMaterial({ color: 0x9fd6c0 }));
+    mesh.position.set(player.x, EYE, player.z);
+    scene.add(mesh);
+    bottlesInAir.push({ mesh, x: player.x, z: player.z, y: EYE, vx: f.x * 14, vz: f.z * 14, vy: 3, life: 2 });
     sfx.bottle();
   }
 
-  function meleeAttack() {
-    if (player.meleeCd > 0) return;
-    player.meleeCd = 0.45;
-    sfx.melee();
-    spark(player.x + Math.cos(player.ang) * 18, player.y + Math.sin(player.ang) * 18, '#ddd', 5);
+  function melee() {
+    if (player.meleeCd > 0 || player.dead) return;
+    player.meleeCd = 0.45; sfx.melee();
+    const f = forwardVec();
     for (const e of enemies) {
       if (e.dead) continue;
-      const d = dist(player.x, player.y, e.x, e.y);
-      if (d < 42) {
-        const a = Math.atan2(e.y - player.y, e.x - player.x);
-        if (Math.abs(angDiff(a, player.ang)) < 1.0) {
-          e.hp -= 45;
-          spark(e.x, e.y, '#aa3322', 8);
-          if (e.hp <= 0) killEnemy(e);
-          else { e.alert = 1; e.state = 'chase'; e.lastX = player.x; e.lastY = player.y; }
+      const d = Math.hypot(e.x - player.x, e.z - player.z);
+      if (d < 2.2) {
+        const a = Math.atan2(e.x - player.x, e.z - player.z);
+        if (Math.abs(angDiff(a, player.yaw)) < 1.0) {
+          e.hp -= 48;
+          if (e.hp <= 0) killEnemy(e); else { e.alert = 1; e.state = 'chase'; e.lastX = player.x; e.lastZ = player.z; }
         }
       }
     }
-    emitNoise(player.x, player.y, 160, false);
+    emitNoise(player.x, player.z, 8, false);
   }
 
   function tryTakedown() {
-    if (state !== 'playing' || player.dead) return;
+    if (player.dead) return;
     for (const e of enemies) {
       if (e.dead) continue;
-      const d = dist(player.x, player.y, e.x, e.y);
-      if (d < 40) {
-        // Must approach from behind & enemy unaware (clickers are always blind so any side works)
-        const behind = Math.abs(angDiff(Math.atan2(player.y - e.y, player.x - e.x), e.ang)) < 1.1;
-        const stealthOk = e.type === 'clicker' ? player.crouch : (player.crouch && e.alert < 0.6 && behind);
-        if (stealthOk) {
-          killEnemy(e, true);
-          toast('Silent takedown');
-          return;
-        }
+      const d = Math.hypot(e.x - player.x, e.z - player.z);
+      if (d < 2.0) {
+        const behind = Math.abs(angDiff(Math.atan2(player.x - e.x, player.z - e.z), e.ang)) < 1.2;
+        const ok = e.type === 'clicker' ? player.crouch : (player.crouch && e.alert < 0.6 && behind);
+        if (ok) { killEnemy(e, true); toast('Silent takedown'); return; }
       }
     }
   }
 
   function killEnemy(e, silent) {
     e.dead = true;
-    spark(e.x, e.y, '#7a1f1f', 16);
+    scene.remove(e.mesh);
+    enemyMeshes = enemyMeshes.filter(o => o.userData.enemy !== e);
     if (silent) blip(90, 0.12, 'sine', 0.05); else sfx.kill();
   }
 
   function useKit() {
     if (player.dead || player.kits <= 0 || player.hp >= player.maxHp) return;
-    player.kits--;
-    player.hp = Math.min(player.maxHp, player.hp + 55);
-    sfx.pickup();
-    toast('Used health kit');
-    spark(player.x, player.y, '#33dd77', 10);
+    player.kits--; player.hp = Math.min(player.maxHp, player.hp + 55);
+    sfx.pickup(); toast('Used health kit');
   }
 
-  // ---------------------------------------------------------------------
-  // Particles / fx
-  // ---------------------------------------------------------------------
-  let shakeAmt = 0;
-  function shake(n) { shakeAmt = Math.max(shakeAmt, n); }
-  function spark(x, y, color, n) {
-    for (let i = 0; i < n; i++) {
-      const a = rand(0, TWO_PI), s = rand(20, 140);
-      particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.3, 0.8), max: 0.8, color, r: rand(1, 3) });
-    }
-  }
-
-  // ---------------------------------------------------------------------
-  // Movement collision
-  // ---------------------------------------------------------------------
-  function moveEntity(ent, dx, dy) {
-    const r = ent.r;
-    if (!isWall(ent.x + dx + Math.sign(dx) * r, ent.y) &&
-        !isWall(ent.x + dx + Math.sign(dx) * r, ent.y - r * 0.7) &&
-        !isWall(ent.x + dx + Math.sign(dx) * r, ent.y + r * 0.7)) {
-      ent.x += dx;
-    }
-    if (!isWall(ent.x, ent.y + dy + Math.sign(dy) * r) &&
-        !isWall(ent.x - r * 0.7, ent.y + dy + Math.sign(dy) * r) &&
-        !isWall(ent.x + r * 0.7, ent.y + dy + Math.sign(dy) * r)) {
-      ent.y += dy;
-    }
-  }
-
-  // ---------------------------------------------------------------------
-  // Update
-  // ---------------------------------------------------------------------
+  // ---------- update ----------
   function update(dt) {
     gameTime += dt;
     if (player.meleeCd > 0) player.meleeCd -= dt;
     if (player.hurtCd > 0) player.hurtCd -= dt;
-
-    // aim toward mouse
-    player.ang = Math.atan2((mouse.y + camY) - player.y, (mouse.x + camX) - player.x);
     player.crouch = !!keys['ShiftLeft'] || !!keys['ShiftRight'];
 
-    // movement
-    let mx = 0, my = 0;
-    if (keys['KeyW'] || keys['ArrowUp']) my -= 1;
-    if (keys['KeyS'] || keys['ArrowDown']) my += 1;
-    if (keys['KeyA'] || keys['ArrowLeft']) mx -= 1;
-    if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
-    const moving = (mx || my);
-    if (moving) {
-      const len = Math.hypot(mx, my);
-      const spd = (player.crouch ? player.speed * 0.55 : player.speed) * dt;
-      moveEntity(player, (mx / len) * spd, (my / len) * spd);
-      // footstep noise
-      player.footTimer -= dt;
-      if (player.footTimer <= 0) {
-        player.footTimer = player.crouch ? 0.55 : 0.35;
-        const onGrass = isGrass(player.x, player.y);
-        const radius = player.crouch ? (onGrass ? 30 : 70) : (onGrass ? 90 : 150);
-        emitNoise(player.x, player.y, radius, false);
+    // movement (camera-relative)
+    let mf = 0, ms = 0;
+    if (keys['KeyW'] || keys['ArrowUp']) mf += 1;
+    if (keys['KeyS'] || keys['ArrowDown']) mf -= 1;
+    if (keys['KeyD'] || keys['ArrowRight']) ms += 1;
+    if (keys['KeyA'] || keys['ArrowLeft']) ms -= 1;
+    if (mf || ms) {
+      const len = Math.hypot(mf, ms);
+      const spd = (player.crouch ? 2.2 : 4.6) * dt;
+      const fwd = forwardVec();
+      const rgt = { x: Math.cos(player.yaw), z: -Math.sin(player.yaw) };
+      let nx = player.x + (fwd.x * mf + rgt.x * ms) / len * spd;
+      let nz = player.z + (fwd.z * mf + rgt.z * ms) / len * spd;
+      if (!blocked(nx, player.z, PLAYER_R)) player.x = nx;
+      if (!blocked(player.x, nz, PLAYER_R)) player.z = nz;
+      player.footT -= dt;
+      if (player.footT <= 0) {
+        player.footT = player.crouch ? 0.55 : 0.34;
+        emitNoise(player.x, player.z, player.crouch ? 2.5 : 7, false);
       }
     }
-    if (keys['Space']) meleeAttack();
+
+    // camera
+    const eyeY = player.crouch ? EYE * 0.7 : EYE;
+    camera.position.set(player.x, eyeY + Math.sin(gameTime * 8) * (mf || ms ? 0.03 : 0), player.z);
+    camera.rotation.set(player.pitch, player.yaw, 0);
+
+    // flashlight follows camera
+    flashlight.intensity = flashOn ? 2.4 : 0;
+    flashlight.position.copy(camera.position);
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+    flashTarget.position.copy(camera.position).add(dir.multiplyScalar(10));
 
     // pickups
     for (const p of pickups) {
       if (p.taken) continue;
-      if (dist2(player.x, player.y, p.x, p.y) < 26 * 26) {
-        p.taken = true; sfx.pickup(); spark(p.x, p.y, '#ffd166', 8);
+      p.mesh.rotation.y += dt * 1.5;
+      p.mesh.position.y = 0.6 + Math.sin(gameTime * 3 + p.bob) * 0.1;
+      if (Math.hypot(p.x - player.x, p.z - player.z) < 1.1) {
+        p.taken = true; p.mesh.visible = false; p.light.visible = false; sfx.pickup();
         if (p.type === 'ammo') { player.ammo += 5; toast('+5 ammo'); }
         else if (p.type === 'bottle') { player.bottles += 2; toast('+2 bottles'); }
         else if (p.type === 'kit') { player.kits += 1; toast('+1 health kit'); }
-        else if (p.type === 'supplies') {
-          supplies++; exitOpen = true;
-          toast('Surgical supplies secured — get to extraction!');
-          setObjective('Reach the extraction pad in the NE corner.');
-        }
+        else if (p.type === 'supplies') { suppliesTaken = true; exitOpen = true; toast('Supplies secured — reach extraction!'); setObjective('Reach the glowing green extraction pad.'); }
       }
     }
 
-    // win condition
-    if (exitOpen && isExit(player.x, player.y)) { win(); return; }
+    // exit
+    if (exitLight) exitLight.intensity = exitOpen ? (1.2 + Math.sin(gameTime * 4) * 0.4) : 0;
+    if (exitPad) exitPad.material.emissiveIntensity = exitOpen ? 1.4 : 0.3;
+    if (exitOpen) {
+      const ew = cellToWorld(exitCell.i, exitCell.j);
+      if (Math.hypot(ew.x - player.x, ew.z - player.z) < 1.8) { win(); return; }
+    }
 
-    updateProjectiles(dt);
     updateEnemies(dt);
-    updateParticles(dt);
+    updateBottles(dt);
+    for (const t of tracers) t.life -= dt;
+    tracers = tracers.filter(t => { if (t.life <= 0) { scene.remove(t.line); return false; } return true; });
     for (const n of noises) n.life -= dt;
     noises = noises.filter(n => n.life > 0);
 
-    // camera follow (clamped)
-    const tcx = player.x - W / 2, tcy = player.y - H / 2;
-    camX += (tcx - camX) * Math.min(1, dt * 8);
-    camY += (tcy - camY) * Math.min(1, dt * 8);
-    camX = clamp(camX, 0, Math.max(0, MAP_W * TILE - W));
-    camY = clamp(camY, 0, Math.max(0, MAP_H * TILE - H));
-    if (MAP_W * TILE < W) camX = (MAP_W * TILE - W) / 2;
-    if (MAP_H * TILE < H) camY = (MAP_H * TILE - H) / 2;
-
-    if (shakeAmt > 0) shakeAmt = Math.max(0, shakeAmt - dt * 30);
+    maxAlert = enemies.reduce((m, e) => e.dead ? m : Math.max(m, e.alert), 0);
     if (player.hp <= 0 && !player.dead) { player.dead = true; die(); }
-
-    // alert indicator decay
-    const maxAlert = enemies.reduce((m, e) => e.dead ? m : Math.max(m, e.alert), 0);
-    alertTimer = maxAlert;
   }
 
-  function updateProjectiles(dt) {
-    for (const pr of projectiles) {
-      if (pr.kind === 'tracer') { pr.life -= dt; continue; }
-      if (pr.kind === 'bottle') {
-        const dx = pr.tx - pr.x, dy = pr.ty - pr.y;
-        const d = Math.hypot(dx, dy);
-        const step = 520 * dt;
-        if (d <= step || pr.life <= 0 || isWall(pr.x + (dx / (d || 1)) * step, pr.y + (dy / (d || 1)) * step)) {
-          // land
-          spark(pr.x, pr.y, '#88ccaa', 10);
-          sfx.bottle();
-          emitNoise(pr.x, pr.y, 360, true);
-          pr.dead = true;
-        } else {
-          pr.x += (dx / d) * step; pr.y += (dy / d) * step; pr.life -= dt;
-        }
-      }
-    }
-    projectiles = projectiles.filter(p => !p.dead && p.life > 0);
-  }
-
-  function updateParticles(dt) {
-    for (const p of particles) {
-      p.x += p.vx * dt; p.y += p.vy * dt;
-      p.vx *= 0.92; p.vy *= 0.92; p.life -= dt;
-    }
-    particles = particles.filter(p => p.life > 0);
-  }
-
-  function canSeePlayer(e) {
-    const d = dist(e.x, e.y, player.x, player.y);
-    if (e.type === 'clicker') return false; // blind
-    let range = 320;
-    const onGrass = isGrass(player.x, player.y);
-    if (player.crouch) range *= onGrass ? 0.28 : 0.7;
-    if (flashlight) {
-      // flashlight makes the player easier to spot if in front of you
-      range *= 1.15;
-    }
+  function canSee(e) {
+    if (e.type === 'clicker') return false;
+    const d = Math.hypot(player.x - e.x, player.z - e.z);
+    let range = 26;
+    if (player.crouch) range *= 0.6;
     if (d > range) return false;
-    const a = Math.atan2(player.y - e.y, player.x - e.x);
-    if (Math.abs(angDiff(a, e.ang)) > FOV / 2) return false;
-    if (losBlocked(e.x, e.y, player.x, player.y)) return false;
-    return true;
+    const a = Math.atan2(player.x - e.x, player.z - e.z);
+    if (Math.abs(angDiff(a, e.ang)) > 0.95) return false;
+    return losClear(e.x, e.z, player.x, player.z);
   }
 
   function updateEnemies(dt) {
     for (const e of enemies) {
       if (e.dead) continue;
-      e.bob += dt * (e.state === 'chase' ? 14 : 6);
-      if (e.attackCd > 0) e.attackCd -= dt;
-      const seeing = canSeePlayer(e);
-      const pd = dist(e.x, e.y, player.x, player.y);
+      e.bob += dt * (e.state === 'chase' ? 12 : 5);
+      if (e.atkCd > 0) e.atkCd -= dt;
+      const pd = Math.hypot(player.x - e.x, player.z - e.z);
+      const seeing = canSee(e);
 
-      // clicker proximity hearing (constant faint awareness)
-      if (e.type === 'clicker' && pd < 70 && !losBlocked(e.x, e.y, player.x, player.y)) {
-        e.alert = Math.min(1, e.alert + dt * 1.4);
-        e.lastX = player.x; e.lastY = player.y;
+      if (e.type === 'clicker' && pd < 4.5 && losClear(e.x, e.z, player.x, player.z)) {
+        e.alert = Math.min(1, e.alert + dt * 1.5); e.lastX = player.x; e.lastZ = player.z;
         if (Math.random() < 0.02) sfx.click();
       }
-
-      if (seeing) {
-        e.alert = Math.min(1, e.alert + dt * (pd < 160 ? 2.4 : 1.4));
-        e.lastX = player.x; e.lastY = player.y;
-      } else {
-        e.alert = Math.max(0, e.alert - dt * 0.35);
-      }
+      if (seeing) { e.alert = Math.min(1, e.alert + dt * (pd < 10 ? 2.4 : 1.4)); e.lastX = player.x; e.lastZ = player.z; }
+      else e.alert = Math.max(0, e.alert - dt * 0.3);
 
       if (e.alert >= 1) e.state = 'chase';
       else if (e.state === 'chase' && e.alert < 0.35) { e.state = 'investigate'; e.investigateT = 4; }
 
-      let tx, ty, spd;
+      let tx, tz, spd;
       if (e.state === 'chase') {
-        tx = e.lastX; ty = e.lastY; spd = e.chaseSpeed;
-        if (seeing || (e.type === 'clicker' && pd < 70)) { e.lastX = player.x; e.lastY = player.y; }
-        if (dist(e.x, e.y, e.lastX, e.lastY) < 12 && !seeing) { e.state = 'investigate'; e.investigateT = 4; }
+        tx = e.lastX; tz = e.lastZ; spd = e.chaseSpeed;
+        if (Math.hypot(e.x - tx, e.z - tz) < 0.6 && !seeing) { e.state = 'investigate'; e.investigateT = 4; }
       } else if (e.state === 'investigate') {
-        tx = e.lastX; ty = e.lastY; spd = e.speed * 1.1;
-        e.investigateT -= dt;
-        if (dist(e.x, e.y, tx, ty) < 14 || e.investigateT <= 0) { e.state = 'patrol'; }
+        tx = e.lastX; tz = e.lastZ; spd = e.speed * 1.1; e.investigateT -= dt;
+        if (Math.hypot(e.x - tx, e.z - tz) < 0.7 || e.investigateT <= 0) e.state = 'patrol';
       } else {
-        const wp = e.wps[e.wpi];
-        tx = wp.x; ty = wp.y; spd = e.speed;
-        if (dist(e.x, e.y, tx, ty) < 16) e.wpi = (e.wpi + 1) % e.wps.length;
+        const wp = e.wps[e.wpi]; tx = wp.x; tz = wp.z; spd = e.speed;
+        if (Math.hypot(e.x - tx, e.z - tz) < 0.7) e.wpi = (e.wpi + 1) % e.wps.length;
       }
 
-      // steer
-      const a = Math.atan2(ty - e.y, tx - e.x);
-      e.ang += angDiff(a, e.ang) * Math.min(1, dt * 7);
-      const before = { x: e.x, y: e.y };
-      moveEntity(e, Math.cos(e.ang) * spd * dt, Math.sin(e.ang) * spd * dt);
-      if (Math.abs(e.x - before.x) < 0.2 && Math.abs(e.y - before.y) < 0.2 && e.state === 'patrol') {
-        e.wpi = (e.wpi + 1) % e.wps.length; // unstick
-      }
+      const desired = Math.atan2(tx - e.x, tz - e.z);
+      e.ang += angDiff(desired, e.ang) * Math.min(1, dt * 6);
+      const mx = Math.sin(e.ang) * spd * dt, mz = Math.cos(e.ang) * spd * dt;
+      let moved = false;
+      if (!blocked(e.x + mx, e.z, PLAYER_R)) { e.x += mx; moved = true; }
+      if (!blocked(e.x, e.z + mz, PLAYER_R)) { e.z += mz; moved = true; }
+      if (!moved && e.state === 'patrol') e.wpi = (e.wpi + 1) % e.wps.length;
 
-      // attack player
-      if (pd < e.r + player.r + 4) {
-        if (e.type === 'clicker') {
-          if (player.hurtCd <= 0) { player.hp = 0; player.hurtCd = 1; sfx.hurt(); }
-        } else if (e.attackCd <= 0) {
-          e.attackCd = 0.7; player.hp -= 14; player.hurtCd = 0.3; sfx.hurt(); shake(5);
-          spark(player.x, player.y, '#cc3322', 6);
+      e.mesh.position.set(e.x, 0, e.z);
+      e.mesh.rotation.y = -e.ang + Math.PI;
+
+      if (pd < 1.15) {
+        if (e.type === 'clicker') { if (player.hurtCd <= 0) { player.hp = 0; player.hurtCd = 1; sfx.hurt(); damageFlash(); } }
+        else if (e.atkCd <= 0) { e.atkCd = 0.7; player.hp -= 14; player.hurtCd = 0.3; sfx.hurt(); damageFlash(); }
+      }
+    }
+  }
+
+  function updateBottles(dt) {
+    for (const b of bottlesInAir) {
+      b.life -= dt; b.vy -= 14 * dt;
+      let nx = b.x + b.vx * dt, nz = b.z + b.vz * dt;
+      b.y += b.vy * dt;
+      if (blocked(nx, nz, 0.1)) { b.vx *= -0.4; b.vz *= -0.4; nx = b.x; nz = b.z; }
+      b.x = nx; b.z = nz;
+      if (b.y <= 0.12) { b.y = 0.12; b.vy *= -0.4; b.vx *= 0.6; b.vz *= 0.6;
+        if (Math.abs(b.vy) < 1.2 && b.life > 0) { // landed
+          emitNoise(b.x, b.z, 18, true); sfx.bottle(); b.life = 0;
         }
       }
+      b.mesh.position.set(b.x, b.y, b.z);
+      if (b.life <= 0) b.dead = true;
     }
+    bottlesInAir = bottlesInAir.filter(b => { if (b.dead) { scene.remove(b.mesh); return false; } return true; });
   }
 
-  // ---------------------------------------------------------------------
-  // Render
-  // ---------------------------------------------------------------------
-  const floorPattern = (() => {
-    const c = document.createElement('canvas'); c.width = c.height = TILE;
-    const g = c.getContext('2d');
-    g.fillStyle = '#23262b'; g.fillRect(0, 0, TILE, TILE);
-    for (let i = 0; i < 26; i++) {
-      g.fillStyle = `rgba(${rand(30,55)|0},${rand(34,60)|0},${rand(36,64)|0},0.6)`;
-      g.fillRect(rand(0, TILE), rand(0, TILE), rand(1, 4), rand(1, 4));
-    }
-    g.strokeStyle = 'rgba(0,0,0,0.25)'; g.strokeRect(0.5, 0.5, TILE - 1, TILE - 1);
-    return c;
-  })();
-
-  function draw() {
-    ctx.clearRect(0, 0, W, H);
-    ctx.save();
-    let ox = 0, oy = 0;
-    if (shakeAmt > 0) { ox = rand(-shakeAmt, shakeAmt); oy = rand(-shakeAmt, shakeAmt); }
-    ctx.translate(-camX + ox, -camY + oy);
-
-    // visible tile range
-    const x0 = Math.max(0, Math.floor(camX / TILE)), x1 = Math.min(MAP_W, Math.ceil((camX + W) / TILE));
-    const y0 = Math.max(0, Math.floor(camY / TILE)), y1 = Math.min(MAP_H, Math.ceil((camY + H) / TILE));
-
-    for (let y = y0; y < y1; y++) {
-      for (let x = x0; x < x1; x++) {
-        const t = grid[y][x], px = x * TILE, py = y * TILE;
-        if (t === 1) {
-          ctx.fillStyle = '#15171b'; ctx.fillRect(px, py, TILE, TILE);
-          ctx.fillStyle = '#2a2e35'; ctx.fillRect(px, py, TILE, 5);
-          ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.strokeRect(px + 0.5, py + 0.5, TILE - 1, TILE - 1);
-        } else {
-          ctx.drawImage(floorPattern, px, py);
-          if (t === 4) {
-            ctx.fillStyle = exitOpen ? 'rgba(80,220,140,0.22)' : 'rgba(220,180,80,0.12)';
-            ctx.fillRect(px, py, TILE, TILE);
-            ctx.strokeStyle = exitOpen ? 'rgba(120,255,170,0.6)' : 'rgba(220,180,80,0.4)';
-            ctx.strokeRect(px + 2.5, py + 2.5, TILE - 5, TILE - 5);
-          }
-          if (t === 2) { // crate
-            ctx.fillStyle = '#4a3b29'; ctx.fillRect(px + 4, py + 4, TILE - 8, TILE - 8);
-            ctx.fillStyle = '#5d4a33'; ctx.fillRect(px + 4, py + 4, TILE - 8, 6);
-            ctx.strokeStyle = '#2c2014'; ctx.strokeRect(px + 4.5, py + 4.5, TILE - 9, TILE - 9);
-          }
-          if (t === 3) { // grass
-            ctx.fillStyle = 'rgba(40,70,38,0.85)'; ctx.fillRect(px, py, TILE, TILE);
-            ctx.strokeStyle = 'rgba(70,110,60,0.7)'; ctx.lineWidth = 2;
-            for (let i = 0; i < 5; i++) {
-              const gx = px + 6 + i * 7 + Math.sin(gameTime * 2 + i + x) * 2;
-              ctx.beginPath(); ctx.moveTo(gx, py + TILE - 3);
-              ctx.lineTo(gx + 2, py + 8); ctx.stroke();
-            }
-            ctx.lineWidth = 1;
-          }
-        }
-      }
-    }
-
-    // noise rings
-    for (const n of noises) {
-      const t = 1 - n.life / n.max;
-      ctx.strokeStyle = `rgba(150,180,255,${0.4 * (1 - t)})`;
-      ctx.beginPath(); ctx.arc(n.x, n.y, n.radius * t, 0, TWO_PI); ctx.stroke();
-    }
-
-    // pickups
-    for (const p of pickups) {
-      if (p.taken) continue;
-      const yo = Math.sin(gameTime * 3 + p.bob) * 2;
-      drawPickup(p.x, p.y + yo, p.type);
-    }
-
-    // enemies
-    for (const e of enemies) { if (!e.dead) drawEnemy(e); else drawCorpse(e); }
-
-    // projectiles
-    for (const pr of projectiles) {
-      if (pr.kind === 'tracer') {
-        ctx.strokeStyle = 'rgba(255,230,150,0.9)'; ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.moveTo(pr.x1, pr.y1); ctx.lineTo(pr.x2, pr.y2); ctx.stroke();
-        ctx.lineWidth = 1;
-      } else if (pr.kind === 'bottle') {
-        ctx.fillStyle = '#9fd6c0'; ctx.beginPath(); ctx.arc(pr.x, pr.y, 4, 0, TWO_PI); ctx.fill();
-      }
-    }
-
-    // particles
-    for (const p of particles) {
-      ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
-      ctx.fillStyle = p.color;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TWO_PI); ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    // player
-    drawPlayer();
-
-    ctx.restore();
-
-    // lighting / fog of war overlay
-    drawLighting(ox, oy);
-
-    // film grain + vignette
-    drawVignette();
-  }
-
-  function drawPickup(x, y, type) {
-    ctx.save(); ctx.translate(x, y);
-    const colors = { ammo: '#e0c060', bottle: '#7fb8a0', kit: '#46c46e', supplies: '#5aa0ff' };
-    ctx.shadowColor = colors[type]; ctx.shadowBlur = 10;
-    ctx.fillStyle = colors[type];
-    if (type === 'ammo') { ctx.fillRect(-6, -4, 12, 8); }
-    else if (type === 'bottle') { ctx.fillRect(-3, -8, 6, 16); ctx.fillRect(-2, -11, 4, 4); }
-    else if (type === 'kit') {
-      ctx.fillRect(-7, -7, 14, 14);
-      ctx.fillStyle = '#fff'; ctx.fillRect(-1.5, -4, 3, 8); ctx.fillRect(-4, -1.5, 8, 3);
-    } else if (type === 'supplies') {
-      ctx.fillRect(-8, -6, 16, 12); ctx.fillStyle = '#cfe3ff'; ctx.fillRect(-8, -6, 16, 3);
-    }
-    ctx.restore();
-  }
-
-  function drawPlayer() {
-    const p = player;
-    // shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
-    ctx.beginPath(); ctx.ellipse(p.x, p.y + 8, 12, 6, 0, 0, TWO_PI); ctx.fill();
-    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.ang);
-    const sc = p.crouch ? 0.85 : 1;
-    ctx.scale(sc, sc);
-    // body
-    ctx.fillStyle = '#3a5a4a'; ctx.beginPath(); ctx.arc(0, 0, 11, 0, TWO_PI); ctx.fill();
-    ctx.fillStyle = '#2c4438'; ctx.fillRect(-11, -4, 6, 8); // backpack
-    // head
-    ctx.fillStyle = '#caa07a'; ctx.beginPath(); ctx.arc(4, 0, 5, 0, TWO_PI); ctx.fill();
-    // weapon
-    ctx.fillStyle = '#1c1c1c'; ctx.fillRect(6, -2, 12, 4);
-    ctx.restore();
-  }
-
-  function drawEnemy(e) {
-    // detection cone for runners
-    if (e.type === 'runner') {
-      let range = 320 * (e.state === 'chase' ? 1.05 : 1);
-      const col = e.state === 'chase' ? 'rgba(255,60,60,' : e.alert > 0.4 ? 'rgba(255,180,60,' : 'rgba(255,255,255,';
-      const grd = ctx.createRadialGradient(e.x, e.y, 8, e.x, e.y, range);
-      grd.addColorStop(0, col + (0.10 + e.alert * 0.12) + ')');
-      grd.addColorStop(1, col + '0)');
-      ctx.fillStyle = grd;
-      ctx.beginPath(); ctx.moveTo(e.x, e.y);
-      ctx.arc(e.x, e.y, range, e.ang - FOV / 2, e.ang + FOV / 2); ctx.closePath(); ctx.fill();
-    } else {
-      // clicker hearing aura
-      ctx.strokeStyle = 'rgba(180,160,200,0.18)';
-      ctx.beginPath(); ctx.arc(e.x, e.y, 70, 0, TWO_PI); ctx.stroke();
-    }
-
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
-    ctx.beginPath(); ctx.ellipse(e.x, e.y + 7, 11, 5, 0, 0, TWO_PI); ctx.fill();
-    ctx.save(); ctx.translate(e.x, e.y); ctx.rotate(e.ang);
-    const sway = Math.sin(e.bob) * 2;
-    if (e.type === 'runner') {
-      ctx.fillStyle = '#6e4038'; ctx.beginPath(); ctx.arc(0, sway, 11, 0, TWO_PI); ctx.fill();
-      ctx.fillStyle = '#8a5246'; ctx.beginPath(); ctx.arc(4, sway, 5, 0, TWO_PI); ctx.fill();
-      ctx.fillStyle = '#c23b2b'; ctx.fillRect(6, -1 + sway, 3, 2);
-    } else {
-      // clicker — pale with fungal bloom on head
-      ctx.fillStyle = '#9b9384'; ctx.beginPath(); ctx.arc(0, sway, 12, 0, TWO_PI); ctx.fill();
-      ctx.fillStyle = '#d8cdb4';
-      for (let i = 0; i < 5; i++) {
-        const a = (i / 5) * TWO_PI + e.bob * 0.3;
-        ctx.beginPath(); ctx.arc(4 + Math.cos(a) * 4, sway + Math.sin(a) * 4, 3, 0, TWO_PI); ctx.fill();
-      }
-    }
-    ctx.restore();
-
-    // health pip if damaged
-    if (e.hp < (e.type === 'clicker' ? 60 : 40)) {
-      ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(e.x - 11, e.y - 18, 22, 3);
-      ctx.fillStyle = '#cc4433'; ctx.fillRect(e.x - 11, e.y - 18, 22 * clamp(e.hp / (e.type === 'clicker' ? 60 : 40), 0, 1), 3);
-    }
-  }
-
-  function drawCorpse(e) {
-    ctx.fillStyle = 'rgba(60,20,20,0.5)';
-    ctx.beginPath(); ctx.ellipse(e.x, e.y, 14, 9, e.ang, 0, TWO_PI); ctx.fill();
-    ctx.fillStyle = 'rgba(110,40,40,0.7)';
-    ctx.beginPath(); ctx.arc(e.x, e.y, 7, 0, TWO_PI); ctx.fill();
-  }
-
-  function drawLighting(ox, oy) {
-    ctx.save();
-    ctx.fillStyle = 'rgba(2,4,8,0.9)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.globalCompositeOperation = 'destination-out';
-    const sx = player.x - camX + ox, sy = player.y - camY + oy;
-    // ambient circle around player
-    let g = ctx.createRadialGradient(sx, sy, 10, sx, sy, 150);
-    g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(sx, sy, 150, 0, TWO_PI); ctx.fill();
-    // flashlight cone toward mouse
-    if (flashlight) {
-      const a = player.ang, len = 460, spread = 0.5;
-      const cg = ctx.createRadialGradient(sx, sy, 20, sx, sy, len);
-      cg.addColorStop(0, 'rgba(0,0,0,1)'); cg.addColorStop(0.7, 'rgba(0,0,0,0.7)'); cg.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = cg;
-      ctx.beginPath(); ctx.moveTo(sx, sy);
-      ctx.arc(sx, sy, len, a - spread, a + spread); ctx.closePath(); ctx.fill();
-    }
-    ctx.restore();
-
-    // warm flashlight tint
-    if (flashlight) {
-      ctx.save();
-      ctx.globalCompositeOperation = 'lighter';
-      const a = player.ang, len = 460, spread = 0.5;
-      const cg = ctx.createRadialGradient(sx, sy, 20, sx, sy, len);
-      cg.addColorStop(0, 'rgba(60,55,40,0.25)'); cg.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = cg;
-      ctx.beginPath(); ctx.moveTo(sx, sy);
-      ctx.arc(sx, sy, len, a - spread, a + spread); ctx.closePath(); ctx.fill();
-      ctx.restore();
-    }
-  }
-
-  function drawVignette() {
-    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75);
-    g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.55)');
-    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-    // low-health red pulse
-    if (player && player.hp < 35 && !player.dead) {
-      const pulse = 0.15 + Math.sin(gameTime * 6) * 0.08;
-      ctx.fillStyle = `rgba(120,0,0,${pulse})`; ctx.fillRect(0, 0, W, H);
-    }
-  }
-
-  // ---------------------------------------------------------------------
-  // HUD
-  // ---------------------------------------------------------------------
+  // ---------- HUD ----------
   function updateHUD() {
     if (!player) return;
     ui.hp.style.width = clamp(player.hp, 0, 100) + '%';
     ui.ammo.textContent = player.ammo;
     ui.bottles.textContent = player.bottles;
     ui.kits.textContent = player.kits;
-    if (alertTimer >= 1) { ui.alert.textContent = 'SPOTTED'; ui.alert.className = 'alert spotted'; }
-    else if (alertTimer > 0.35) { ui.alert.textContent = 'HUNTING'; ui.alert.className = 'alert hunting'; }
+    if (maxAlert >= 1) { ui.alert.textContent = 'SPOTTED'; ui.alert.className = 'alert spotted'; }
+    else if (maxAlert > 0.35) { ui.alert.textContent = 'HUNTING'; ui.alert.className = 'alert hunting'; }
     else { ui.alert.textContent = 'HIDDEN'; ui.alert.className = 'alert hidden'; }
   }
   function setObjective(t) { ui.objective.textContent = t; }
-  function toast(t) { ui.toast.textContent = t; ui.toast.classList.add('show'); toastTimer = 2.4; }
+  let toastT = 0;
+  function toast(t) { ui.toast.textContent = t; ui.toast.classList.add('show'); toastT = 2.4; }
+  function damageFlash() { ui.flash.style.opacity = '0.55'; }
+  function flashMuzzle() { ui.flash.style.background = 'radial-gradient(circle, rgba(255,220,120,0.25), transparent 60%)'; ui.flash.style.opacity = '0.5'; setTimeout(() => { ui.flash.style.background = 'rgba(140,0,0,0.6)'; }, 60); }
 
-  // ---------------------------------------------------------------------
-  // State / overlay
-  // ---------------------------------------------------------------------
-  function showOverlay(title, text, btn) {
-    ui.overlayTitle.textContent = title;
-    ui.overlayText.innerHTML = text;
-    ui.overlayBtn.textContent = btn;
-    ui.overlay.classList.add('show');
-  }
-  function hideOverlay() { ui.overlay.classList.remove('show'); }
-
-  function startGame() { reset(); state = 'playing'; hideOverlay(); actx(); }
-  function pause() { state = 'paused'; showOverlay('Paused', controlsHTML(), 'Resume'); }
-  function resume() { state = 'playing'; hideOverlay(); }
-  function die() {
-    state = 'dead';
-    showOverlay('You did not make it', 'The infected overwhelmed you in the ruins of Seattle.<br>Stay low. Stay quiet. Try again.', 'Retry');
-  }
-  function win() {
-    state = 'won'; sfx.win();
-    showOverlay('Extracted', 'You secured the supplies and slipped out of the city alive.<br><b>Survivor.</b>', 'Play again');
-  }
-
-  function controlsHTML() {
+  // ---------- overlay / state ----------
+  function ctrlsHTML() {
     return `<div class="ctrls">
-      <span><b>WASD</b> / Arrows — Move</span>
-      <span><b>Hold Shift</b> — Crouch (quiet, hides in grass)</span>
-      <span><b>Mouse</b> — Aim &nbsp; <b>Left-Click</b> — Fire pistol (loud!)</span>
-      <span><b>Right-Click</b> — Throw bottle (distraction)</span>
-      <span><b>Space</b> — Melee &nbsp; <b>E</b> — Stealth takedown (crouch, from behind)</span>
-      <span><b>R</b> — Use health kit &nbsp; <b>F</b> — Toggle flashlight</span>
-      <span><b>Esc / P</b> — Pause</span>
+      <span><b>Mouse</b> — Look &nbsp; <b>WASD</b> — Move</span>
+      <span><b>Hold Shift</b> — Crouch (quiet & lower profile)</span>
+      <span><b>Left-Click</b> — Fire pistol (loud!) &nbsp; <b>Right-Click</b> — Throw bottle</span>
+      <span><b>Space</b> — Melee &nbsp; <b>E</b> — Stealth takedown (crouch / from behind)</span>
+      <span><b>R</b> — Health kit &nbsp; <b>F</b> — Flashlight &nbsp; <b>Esc</b> — Pause</span>
     </div>`;
   }
+  function showOverlay(title, text, btn) {
+    ui.overlayTitle.textContent = title; ui.overlayText.innerHTML = text;
+    ui.overlayBtn.textContent = btn; ui.overlayBtn.style.display = '';
+    ui.overlay.classList.add('show'); ui.crosshair.style.display = 'none';
+  }
+  function hideOverlay() { ui.overlay.classList.remove('show'); ui.crosshair.style.display = 'block'; }
+  function startGame() { resetWorld(); state = 'playing'; hideOverlay(); actx(); canvas.requestPointerLock(); }
+  function pause() { if (state !== 'playing') return; state = 'paused'; showOverlay('Paused', ctrlsHTML(), 'Resume'); }
+  function resume() { state = 'playing'; hideOverlay(); canvas.requestPointerLock(); }
+  function die() { state = 'dead'; document.exitPointerLock(); showOverlay('You did not make it', 'The Infected caught you in the ruins of Seattle.<br>Stay low. Stay quiet. Try again.', 'Retry'); }
+  function win() { state = 'won'; document.exitPointerLock(); sfx.win(); showOverlay('Extracted', 'You secured the supplies and slipped out alive.<br><b>Survivor.</b>', 'Play again'); }
 
-  ui.overlayBtn.addEventListener('click', () => {
-    if (state === 'paused') resume();
-    else startGame();
-  });
+  ui.overlayBtn.addEventListener('click', () => { if (state === 'paused') resume(); else startGame(); });
 
-  // ---------------------------------------------------------------------
-  // Loop
-  // ---------------------------------------------------------------------
+  // ---------- loop ----------
   let last = performance.now();
   function loop(now) {
     let dt = (now - last) / 1000; last = now;
     if (dt > 0.05) dt = 0.05;
     if (state === 'playing') { update(dt); updateHUD(); }
-    if (toastTimer > 0) { toastTimer -= dt; if (toastTimer <= 0) ui.toast.classList.remove('show'); }
-    if (state === 'playing' || state === 'paused' || state === 'won' || state === 'dead') {
-      if (player) draw();
-    }
+    if (toastT > 0) { toastT -= dt; if (toastT <= 0) ui.toast.classList.remove('show'); }
+    // fade damage/muzzle flash
+    const cur = parseFloat(ui.flash.style.opacity || '0');
+    if (cur > 0) ui.flash.style.opacity = Math.max(0, cur - dt * 1.6).toString();
+    renderer.render(scene, camera);
     requestAnimationFrame(loop);
   }
 
-  // boot
+  // boot: build a level for the menu backdrop
+  genGrid(); buildLevel(); resetPlayer();
+  camera.position.set(player.x, EYE, player.z);
+  camera.rotation.set(0, player.yaw, 0);
   showOverlay('THE LAST OF US — PART II',
-    '<i>Unofficial fan tribute · original code &amp; art</i><br><br>' +
-    'Seattle has fallen. Scavenge surgical supplies and reach extraction — but the Infected hunt by sight and sound. ' +
-    'Stay crouched, use grass for cover, distract with bottles, and save your bullets.' + controlsHTML(),
-    'Start');
+    '<i>Unofficial 3D fan tribute · original code &amp; geometry</i><br><br>' +
+    'Seattle has fallen. Scavenge the surgical supplies and reach extraction — but the Infected hunt by sight and sound. ' +
+    'Crouch to stay quiet, distract them with bottles, and save your bullets.' + ctrlsHTML(),
+    'Click to Start');
   requestAnimationFrame(loop);
 })();
