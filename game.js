@@ -337,6 +337,92 @@
     return { i: Math.floor(GW / 2), j: Math.floor(GH / 2) };
   }
 
+  // ---------- companion (Ellie) ----------
+  const FBX_SCALE = 0.01;     // Mixamo exports in cm -> scale to meters
+  const FBX_FACE = Math.PI;   // yaw offset so the model faces its travel direction
+  let companion = null;
+
+  function makePlaceholderCompanion() {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.3, 0.36, 1.1, 10),
+      new THREE.MeshStandardMaterial({ color: 0x46708c, roughness: 0.85 })
+    );
+    body.position.y = 0.85; body.castShadow = true; g.add(body);
+    const head = new THREE.Mesh(
+      new THREE.SphereGeometry(0.25, 12, 10),
+      new THREE.MeshStandardMaterial({ color: 0xcaa890, roughness: 0.8 })
+    );
+    head.position.y = 1.55; head.castShadow = true; g.add(head);
+    return g;
+  }
+
+  function initCompanion() {
+    companion = { group: makePlaceholderCompanion(), mixer: null, action: null,
+      x: player.x, z: player.z, ang: player.yaw, attackCd: 0, real: false };
+    companion.group.position.set(player.x, 0, player.z);
+    scene.add(companion.group);
+
+    if (typeof THREE.FBXLoader !== 'function') return;
+    const loader = new THREE.FBXLoader();
+    loader.load('models/ellie.fbx', (obj) => {
+      obj.scale.setScalar(FBX_SCALE);
+      obj.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = false; } });
+      scene.remove(companion.group);
+      obj.position.set(companion.x, 0, companion.z);
+      scene.add(obj);
+      companion.group = obj; companion.real = true;
+      if (obj.animations && obj.animations.length) {
+        companion.mixer = new THREE.AnimationMixer(obj);
+        companion.action = companion.mixer.clipAction(obj.animations[0]);
+        companion.action.play(); companion.action.paused = true; // hold a neutral frame
+        companion.mixer.addEventListener('finished', () => {
+          if (companion.action) { companion.action.paused = true; companion.action.time = 0; }
+        });
+      }
+      toast('Ellie is with you');
+    }, undefined, () => { /* ellie.fbx not in the repo yet: keep placeholder */ });
+  }
+
+  function companionStab(e) {
+    if (companion.action) {
+      companion.action.reset();
+      companion.action.setLoop(THREE.LoopOnce, 1);
+      companion.action.clampWhenFinished = true;
+      companion.action.paused = false;
+      companion.action.play();
+    }
+    e.hp -= 42; sfx.melee();
+    if (e.hp <= 0) killEnemy(e, true);
+    else { e.alert = 1; e.state = 'chase'; e.lastX = player.x; e.lastZ = player.z; }
+  }
+
+  function updateCompanion(dt) {
+    if (!companion || !companion.group) return;
+    if (companion.mixer) companion.mixer.update(dt);
+    const back = forwardVec();
+    const tx = player.x - back.x * 2.3, tz = player.z - back.z * 2.3;
+    const dx = tx - companion.x, dz = tz - companion.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist > 0.5) {
+      const spd = Math.min(6, 2.4 + dist * 1.2) * dt;
+      const nx = companion.x + (dx / dist) * spd, nz = companion.z + (dz / dist) * spd;
+      if (!blocked(nx, companion.z, 0.34)) companion.x = nx;
+      if (!blocked(companion.x, nz, 0.34)) companion.z = nz;
+      companion.ang = Math.atan2(dx, dz);
+    }
+    if (dist > 16) { companion.x = player.x; companion.z = player.z; } // unstick if separated
+    companion.group.position.set(companion.x, 0, companion.z);
+    companion.group.rotation.y = companion.ang + FBX_FACE;
+    companion.attackCd -= dt;
+    if (companion.attackCd <= 0) {
+      for (const e of enemies) {
+        if (e.dead) continue;
+        if (Math.hypot(e.x - companion.x, e.z - companion.z) < 1.7) { companionStab(e); companion.attackCd = 1.5; break; }
+      }
+    }
+  }
+
   // ---------- player ----------
   let player;
   function resetPlayer() {
@@ -368,6 +454,7 @@
     // supplies near exit corner
     spawnPickup('supplies', GW - 5, GH - 5);
     suppliesTaken = false; exitOpen = false; gameTime = 0; maxAlert = 0; flashOn = true;
+    if (companion) { companion.x = player.x; companion.z = player.z; if (companion.group) companion.group.position.set(player.x, 0, player.z); }
     setObjective('Find the surgical supplies, then reach the green extraction pad.');
   }
 
@@ -585,6 +672,7 @@
     }
 
     updateEnemies(dt);
+    updateCompanion(dt);
     updateBottles(dt);
     for (const t of tracers) t.life -= dt;
     tracers = tracers.filter(t => { if (t.life <= 0) { scene.remove(t.line); return false; } return true; });
@@ -729,6 +817,7 @@
 
   // boot: build a level for the menu backdrop
   genGrid(); buildLevel(); resetPlayer();
+  initCompanion();
   camera.position.set(player.x, EYE, player.z);
   camera.rotation.set(0, player.yaw, 0);
   showOverlay('THE LAST OF US — PART II',
